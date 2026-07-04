@@ -22,7 +22,8 @@ type LoopDetectorKind =
   | "unknown_tool_repeat"
   | "known_poll_no_progress"
   | "global_circuit_breaker"
-  | "ping_pong";
+  | "ping_pong"
+  | "exec_running_repeat";
 
 type LoopDetectionResult =
   | { stuck: false }
@@ -41,6 +42,13 @@ export const WARNING_THRESHOLD = 10;
 export const UNKNOWN_TOOL_THRESHOLD = 10;
 export const CRITICAL_THRESHOLD = 20;
 export const GLOBAL_CIRCUIT_BREAKER_THRESHOLD = 30;
+/**
+ * How many times exec can be called with the same command after a previous call
+ * returned status=running before the detector blocks. The model should use
+ * process(action=poll) for follow-up on backgrounded sessions.
+ * Warning fires on the second repeat; block fires at this threshold.
+ */
+export const EXEC_RUNNING_REPEAT_CRITICAL_THRESHOLD = 3;
 const DEFAULT_LOOP_DETECTION_CONFIG = {
   enabled: false,
   historySize: TOOL_CALL_HISTORY_SIZE,
@@ -48,10 +56,12 @@ const DEFAULT_LOOP_DETECTION_CONFIG = {
   unknownToolThreshold: UNKNOWN_TOOL_THRESHOLD,
   criticalThreshold: CRITICAL_THRESHOLD,
   globalCircuitBreakerThreshold: GLOBAL_CIRCUIT_BREAKER_THRESHOLD,
+  execRunningRepeatThreshold: EXEC_RUNNING_REPEAT_CRITICAL_THRESHOLD,
   detectors: {
     genericRepeat: true,
     knownPollNoProgress: true,
     pingPong: true,
+    execRunningRepeat: true,
   },
 };
 
@@ -62,10 +72,12 @@ type ResolvedLoopDetectionConfig = {
   unknownToolThreshold: number;
   criticalThreshold: number;
   globalCircuitBreakerThreshold: number;
+  execRunningRepeatThreshold: number;
   detectors: {
     genericRepeat: boolean;
     knownPollNoProgress: boolean;
     pingPong: boolean;
+    execRunningRepeat: boolean;
   };
 };
 
@@ -126,7 +138,14 @@ function resolveLoopDetectionConfig(config?: ToolLoopDetectionConfig): ResolvedL
         config?.detectors?.knownPollNoProgress ??
         DEFAULT_LOOP_DETECTION_CONFIG.detectors.knownPollNoProgress,
       pingPong: config?.detectors?.pingPong ?? DEFAULT_LOOP_DETECTION_CONFIG.detectors.pingPong,
+      execRunningRepeat:
+        config?.detectors?.execRunningRepeat ??
+        DEFAULT_LOOP_DETECTION_CONFIG.detectors.execRunningRepeat,
     },
+    execRunningRepeatThreshold: asPositiveInt(
+      config?.execRunningRepeatThreshold,
+      DEFAULT_LOOP_DETECTION_CONFIG.execRunningRepeatThreshold,
+    ),
   };
 }
 
@@ -326,7 +345,7 @@ function hashToolOutcome(
   params: unknown,
   result: unknown,
   error: unknown,
-): { resultHash?: string; unknownToolName?: string } {
+): { resultHash?: string; unknownToolName?: string; execRunning?: boolean } {
   if (error !== undefined) {
     const unknownToolName = extractUnknownToolName(error);
     return {
@@ -348,7 +367,8 @@ function hashToolOutcome(
   if (toolName === "exec") {
     const execHash = hashExecToolOutcome(details, text);
     if (execHash) {
-      return { resultHash: execHash };
+      // Flag running status so the exec_running_repeat detector can apply a lower threshold.
+      return { resultHash: execHash, execRunning: stringField(details.status) === "running" };
     }
   }
   if (isKnownPollToolCall(toolName, params) && toolName === "process" && isPlainObject(params)) {
@@ -556,6 +576,37 @@ function canonicalPairKey(signatureA: string, signatureB: string): string {
 }
 
 /**
+ * Count how many times exec has been called with the same command (argsHash) while a
+ * previous call with that same command returned status="running". This detects the pattern
+ * where the model re-launches exec instead of using process(action=poll) for follow-up.
+ *
+ * The streak counts only consecutive history records for this toolName+argsHash pair that
+ * have execRunning=true, scanning backwards from the most recent call.
+ */
+function getExecRunningRepeatStreak(
+  history: Array<{ toolName: string; argsHash: string; execRunning?: boolean }>,
+  toolName: string,
+  argsHash: string,
+): number {
+  if (toolName !== "exec") {
+    return 0;
+  }
+  let streak = 0;
+  for (let i = history.length - 1; i >= 0; i -= 1) {
+    const record = history[i];
+    if (!record || record.toolName !== toolName || record.argsHash !== argsHash) {
+      continue;
+    }
+    if (!record.execRunning) {
+      // A non-running result (completed/failed) ends the streak — the session resolved.
+      break;
+    }
+    streak += 1;
+  }
+  return streak;
+}
+
+/**
  * Detect if an agent is stuck in a repetitive tool call loop.
  * Checks if the same tool+params combination has been called excessively.
  */
@@ -587,6 +638,48 @@ export function detectToolCallLoop(
       message: `CRITICAL: attempted unavailable tool ${unknownToolStreak.unknownToolName ?? toolName} ${unknownToolStreak.count} times. Stop retrying that missing tool and answer without it.`,
       warningKey: `unknown-tool:${toolName}:${unknownToolStreak.unknownToolName ?? "unknown"}`,
     };
+  }
+
+  // exec-running-repeat: the model called exec again with the same command while the previous
+  // call returned status="running". The model must use process(action=poll) for follow-up,
+  // not re-launch exec. This fires at a much lower threshold than generic loop detection
+  // because re-running a live session is always a protocol error, not a legitimate retry.
+  if (resolvedConfig.detectors.execRunningRepeat) {
+    const execRunningStreak = getExecRunningRepeatStreak(history, toolName, currentHash);
+    if (execRunningStreak > 0) {
+      const warningKey = `exec-running:${currentHash}`;
+      if (execRunningStreak >= resolvedConfig.execRunningRepeatThreshold) {
+        log.error(
+          `exec_running_repeat critical: same exec command called ${execRunningStreak} times while previous session was still running`,
+        );
+        return {
+          stuck: true,
+          level: "critical",
+          detector: "exec_running_repeat",
+          count: execRunningStreak,
+          message:
+            `CRITICAL: exec was called ${execRunningStreak} times with the same command while a previous session for that command was still running. ` +
+            `Use process(action=poll) or process(action=log) to check the running session instead of re-launching exec. ` +
+            `Calling exec again starts a new session and does not give you the output of the existing one.`,
+          warningKey,
+        };
+      }
+      // Warn on the first repeat so the model can self-correct before hitting the critical block.
+      log.warn(
+        `exec_running_repeat warning: exec called again while previous session was still running (count=${execRunningStreak})`,
+      );
+      return {
+        stuck: true,
+        level: "warning",
+        detector: "exec_running_repeat",
+        count: execRunningStreak,
+        message:
+          `WARNING: exec was called again with the same command while the previous session is still running. ` +
+          `Use process(action=poll) to check the status of the existing session instead of starting a new one. ` +
+          `Re-running exec does not give you the running session's output.`,
+        warningKey,
+      };
+    }
   }
 
   if (noProgressStreak >= resolvedConfig.globalCircuitBreakerThreshold) {
@@ -794,6 +887,9 @@ export function recordToolCallOutcome(
     }
     call.resultHash = resultHash;
     call.unknownToolName = outcome.unknownToolName;
+    if (outcome.execRunning) {
+      call.execRunning = true;
+    }
     matched = true;
     recordedOutcome = call;
     break;
@@ -807,6 +903,7 @@ export function recordToolCallOutcome(
       ...(runId && { runId }),
       resultHash,
       unknownToolName: outcome.unknownToolName,
+      ...(outcome.execRunning ? { execRunning: true } : {}),
       timestamp: Date.now(),
     };
     state.toolCallHistory.push(record);

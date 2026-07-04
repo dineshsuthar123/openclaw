@@ -26,6 +26,8 @@ export type ToolCallRecord = {
   runId?: string;
   resultHash?: string;
   unknownToolName?: string;
+  /** True when the exec tool result carried status="running" (backgrounded/yielded session). */
+  execRunning?: boolean;
   timestamp: number;
 };
 

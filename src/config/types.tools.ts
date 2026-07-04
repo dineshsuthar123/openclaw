@@ -173,6 +173,12 @@ export type ToolLoopDetectionDetectorConfig = {
   knownPollNoProgress?: boolean;
   /** Enable warning/blocking for no-progress ping-pong alternating patterns. */
   pingPong?: boolean;
+  /**
+   * Enable warning/blocking when exec is called again while a previous exec session
+   * with the same command is still running. The model should use process(action=poll)
+   * instead of re-launching. Default: true.
+   */
+  execRunningRepeat?: boolean;
 };
 
 export type ToolLoopPostCompactionGuardConfig = {
@@ -193,6 +199,12 @@ export type ToolLoopDetectionConfig = {
   criticalThreshold?: number;
   /** Global no-progress breaker threshold (default: 30). */
   globalCircuitBreakerThreshold?: number;
+  /**
+   * Threshold for blocking exec re-runs when the previous call returned status="running".
+   * The model should use process(action=poll) instead of re-launching exec.
+   * Applied at warning level on the second repeat and critical level at this threshold (default: 3).
+   */
+  execRunningRepeatThreshold?: number;
   /** Detector toggles. */
   detectors?: ToolLoopDetectionDetectorConfig;
   /** Post-compaction loop guard: aborts when the agent repeats the same (tool, args, result) immediately after auto-compaction-retry. */

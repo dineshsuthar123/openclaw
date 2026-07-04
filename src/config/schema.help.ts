@@ -760,6 +760,10 @@ export const FIELD_HELP: Record<string, string> = {
   "tools.loopDetection.detectors.knownPollNoProgress":
     "Enable known poll tool no-progress loop detection (default: true).",
   "tools.loopDetection.detectors.pingPong": "Enable ping-pong loop detection (default: true).",
+  "tools.loopDetection.detectors.execRunningRepeat":
+    "Enable detection of exec being called again while a previous session for the same command is still running. The model should use process(action=poll) instead of re-launching exec (default: true).",
+  "tools.loopDetection.execRunningRepeatThreshold":
+    "Number of exec re-runs with status=running before the session is blocked (default: 3). Warning fires on the first repeat; block fires at this threshold.",
   "tools.loopDetection.postCompactionGuard.windowSize":
     "Number of post-compaction attempts during which the guard stays armed (default: 3). Lower values are stricter; higher values give the agent more attempts before abort.",
   "tools.exec.notifyOnExit":

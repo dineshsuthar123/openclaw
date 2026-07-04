@@ -1264,5 +1264,157 @@ describe("tool-loop-detection", () => {
       expect(loopResult.stuck && loopResult.level).not.toBe("critical");
     });
   });
+});
 
+// ---------------------------------------------------------------------------
+// exec_running_repeat detector
+// ---------------------------------------------------------------------------
+
+import { EXEC_RUNNING_REPEAT_CRITICAL_THRESHOLD } from "./tool-loop-detection.js";
+
+function makeRunningExecResult(sessionId: string, tail = "") {
+  return {
+    content: [
+      {
+        type: "text",
+        text: `Command still running (session ${sessionId}). Use process for follow-up.`,
+      },
+    ],
+    details: { status: "running", sessionId, tail },
+  };
+}
+
+function makeCompletedExecResult(output: string, exitCode = 0) {
+  return {
+    content: [{ type: "text", text: output }],
+    details: { status: "completed", exitCode, aggregated: output },
+  };
+}
+
+describe("exec_running_repeat detector", () => {
+  const cfg: ToolLoopDetectionConfig = { enabled: true };
+  const params = { command: "ls -la" };
+
+  function recordExecCall(state: SessionState, result: object, i: number) {
+    const toolCallId = `exec-${i}`;
+    recordToolCall(state, "exec", params, toolCallId);
+    recordToolCallOutcome(state, {
+      toolName: "exec",
+      toolParams: params,
+      toolCallId,
+      result,
+    });
+  }
+
+  it("does not trigger when no previous running result exists", () => {
+    const state = createState();
+    // First call returns running — no history yet to compare against
+    recordExecCall(state, makeRunningExecResult("session-1"), 0);
+    const result = detectToolCallLoop(state, "exec", params, cfg);
+    expect(result.stuck).toBe(false);
+  });
+
+  it("fires a warning on the first repeat after a running result", () => {
+    const state = createState();
+    recordExecCall(state, makeRunningExecResult("session-1"), 0);
+    // Second call with same command while session-1 is still running → warning
+    recordExecCall(state, makeRunningExecResult("session-2"), 1);
+    const result = detectToolCallLoop(state, "exec", params, cfg);
+    expect(result.stuck).toBe(true);
+    if (!result.stuck) return;
+    expect(result.level).toBe("warning");
+    expect(result.detector).toBe("exec_running_repeat");
+    expect(result.count).toBe(1);
+  });
+
+  it(`blocks at execRunningRepeatThreshold=${EXEC_RUNNING_REPEAT_CRITICAL_THRESHOLD} repeats`, () => {
+    const state = createState();
+    // First call starts the running session
+    recordExecCall(state, makeRunningExecResult("session-0"), 0);
+    // Additional repeats until we hit the critical threshold
+    for (let i = 1; i <= EXEC_RUNNING_REPEAT_CRITICAL_THRESHOLD; i++) {
+      recordExecCall(state, makeRunningExecResult(`session-${i}`), i);
+    }
+    const result = detectToolCallLoop(state, "exec", params, cfg);
+    expect(result.stuck).toBe(true);
+    if (!result.stuck) return;
+    expect(result.level).toBe("critical");
+    expect(result.detector).toBe("exec_running_repeat");
+    expect(result.count).toBeGreaterThanOrEqual(EXEC_RUNNING_REPEAT_CRITICAL_THRESHOLD);
+  });
+
+  it("resets streak when exec completes successfully between calls", () => {
+    const state = createState();
+    recordExecCall(state, makeRunningExecResult("session-1"), 0);
+    // Session completes — streak should reset
+    recordExecCall(state, makeCompletedExecResult("file.txt\n"), 1);
+    // New exec call after a completed result — NOT a running repeat
+    const result = detectToolCallLoop(state, "exec", params, cfg);
+    expect(result.stuck).toBe(false);
+  });
+
+  it("does not trigger when loop detection is disabled", () => {
+    const state = createState();
+    const disabledCfg: ToolLoopDetectionConfig = { enabled: false };
+    recordExecCall(state, makeRunningExecResult("session-1"), 0);
+    recordExecCall(state, makeRunningExecResult("session-2"), 1);
+    const result = detectToolCallLoop(state, "exec", params, disabledCfg);
+    expect(result.stuck).toBe(false);
+  });
+
+  it("does not trigger for a different exec command", () => {
+    const state = createState();
+    const params1 = { command: "ls -la" };
+    const params2 = { command: "cat file.txt" };
+    // First command returns running
+    recordToolCall(state, "exec", params1, "exec-0");
+    recordToolCallOutcome(state, {
+      toolName: "exec",
+      toolParams: params1,
+      toolCallId: "exec-0",
+      result: makeRunningExecResult("session-1"),
+    });
+    // Different command — should not count as a repeat of params1's running streak
+    const result = detectToolCallLoop(state, "exec", params2, cfg);
+    expect(result.stuck).toBe(false);
+  });
+
+  it("respects custom execRunningRepeatThreshold", () => {
+    const state = createState();
+    const strictCfg: ToolLoopDetectionConfig = { enabled: true, execRunningRepeatThreshold: 1 };
+    recordExecCall(state, makeRunningExecResult("session-1"), 0);
+    // One repeat is already at the custom threshold of 1
+    recordExecCall(state, makeRunningExecResult("session-2"), 1);
+    const result = detectToolCallLoop(state, "exec", params, strictCfg);
+    expect(result.stuck).toBe(true);
+    if (!result.stuck) return;
+    expect(result.level).toBe("critical");
+    expect(result.detector).toBe("exec_running_repeat");
+  });
+
+  it("stores execRunning flag on ToolCallRecord for running exec results", () => {
+    const state = createState();
+    recordToolCall(state, "exec", params, "exec-0");
+    recordToolCallOutcome(state, {
+      toolName: "exec",
+      toolParams: params,
+      toolCallId: "exec-0",
+      result: makeRunningExecResult("session-1"),
+    });
+    const record = state.toolCallHistory?.find((r) => r.toolCallId === "exec-0");
+    expect(record?.execRunning).toBe(true);
+  });
+
+  it("does not set execRunning flag for completed exec results", () => {
+    const state = createState();
+    recordToolCall(state, "exec", params, "exec-0");
+    recordToolCallOutcome(state, {
+      toolName: "exec",
+      toolParams: params,
+      toolCallId: "exec-0",
+      result: makeCompletedExecResult("hello world\n"),
+    });
+    const record = state.toolCallHistory?.find((r) => r.toolCallId === "exec-0");
+    expect(record?.execRunning).toBeFalsy();
+  });
 });
